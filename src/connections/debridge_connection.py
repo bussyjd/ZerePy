@@ -5,6 +5,8 @@ from typing import Dict, Any, List
 from dotenv import load_dotenv
 from src.connections.base_connection import BaseConnection, Action, ActionParameter
 from src.connections.solana_connection import SolanaConnection
+from src.connections.evm_connection import EVMConnection
+from src.connections.sonic_connection import SonicConnection
 
 logger = logging.getLogger("connections.debridge_connection")
 
@@ -23,7 +25,54 @@ class DeBridgeConnection(BaseConnection):
         load_dotenv()
         self.api_url = os.getenv("DEBRIDGE_API_URL", "https://dln.debridge.finance/v1.0")
         self._session = requests.Session()
-        self.solana_connection = None  # Will be set by connection manager
+        self._chain_connection = None
+        self._chain_type = None
+        
+    def set_chain_connection(self, connection: Any):
+        if hasattr(connection, 'aggregator_api'):  # Sonic-specific attribute
+            self._chain_type = 'sonic'
+        elif hasattr(connection, '_web3'): 
+            self._chain_type = 'evm'
+        elif hasattr(connection, '_get_connection_async'):
+            self._chain_type = 'solana'
+        else:
+            raise ValueError("Unsupported chain type")
+        self._chain_connection = connection
+
+    async def execute_bridge_tx(self, dest_chain_id: int, dest_receiver: str, 
+                                src_asset: str, src_amount: float):
+        if not self._chain_connection:
+            raise ValueError("No chain connection configured")
+
+        # Chain-agnostic address retrieval
+        sender_addr = self._get_sender_address()
+        
+        # Unified fee quoting
+        quote = await self._get_fee_quote(sender_addr, dest_chain_id, dest_receiver,
+                                        src_asset, src_amount)
+                                        
+        # Chain-specific TX building
+        if self._chain_type == 'evm':
+            tx_data = self._build_evm_tx(src_asset, src_amount, quote)
+        elif self._chain_type == 'solana':
+            tx_data = await self._build_solana_tx(src_asset, src_amount, quote)
+            
+        return await self._send_transaction(tx_data)
+
+    def _get_sender_address(self) -> str:
+        """Universal address getter"""
+        if self._chain_type == 'evm':
+            return self._chain_connection.get_address()
+        elif self._chain_type == 'solana':
+            return str(self._chain_connection._get_wallet().public_key)
+            
+    async def _send_transaction(self, tx_data: Dict) -> str:
+        """Unified transaction sending"""
+        if self._chain_type == 'evm' or self._chain_type == 'sonic':
+            return self._chain_connection.send_transaction(tx_data)
+        elif self._chain_type == 'solana':
+            async with self._chain_connection._get_connection_async() as conn:
+                return await conn.send_transaction(tx_data)
 
     def set_solana_connection(self, connection: SolanaConnection):
         """Set the Solana connection from the connection manager"""
@@ -122,8 +171,7 @@ class DeBridgeConnection(BaseConnection):
                         dstChainTokenOutRecipient: str,
                         dstChainTokenOutAmount: str = "auto",
                         affiliateFeePercent: str = "0",
-                        prependOperatingExpenses: bool = True,
-                        skipSolanaRecipientValidation: bool = False) -> Dict[str, Any]:
+                        prependOperatingExpenses: bool = True) -> Dict[str, Any]:
         """
         Create a cross-chain bridging transaction
         """
@@ -142,8 +190,9 @@ class DeBridgeConnection(BaseConnection):
             "dstChainTokenOutAmount": dstChainTokenOutAmount,
             "affiliateFeePercent": affiliateFeePercent,
             "prependOperatingExpenses": str(prependOperatingExpenses).lower(),
-            "skipSolanaRecipientValidation": str(skipSolanaRecipientValidation).lower(),
-            "referralCode": "21064",  # Default referral code
+            **({"skipSolanaRecipientValidation": "true"} if self._chain_type == 'solana' else {}),  # Optional Solana recipient validation
+            "referralCode": "21064",  # Analytics
+            "deBridgeApp": "ZEREPY",  # Analytics
             "dstChainTokenOutRecipient": dstChainTokenOutRecipient,  # Required destination address
             "srcChainOrderAuthorityAddress": solana_address,  # Always use source chain address
             "dstChainOrderAuthorityAddress": dstChainTokenOutRecipient  # Use destination address
@@ -260,40 +309,40 @@ class DeBridgeConnection(BaseConnection):
             logger.error(f"Failed to fetch token information: {str(e)}")
             raise DeBridgeAPIError(f"Failed to fetch token information: {str(e)}")
 
-    def execute_bridge_tx(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute a bridge transaction using stored transaction data
-        Returns: Transaction signature
-        """
+    async def execute_bridge_tx(self, params: Dict):
         try:
-            if not self.solana_connection:
-                raise DeBridgeConnectionError("Solana connection not set")
-
+            if not self._chain_connection:
+                raise DeBridgeConnectionError("No chain connection configured")
+                
             tx_data = params.get("tx_data")
             if not tx_data:
-                raise DeBridgeConnectionError("No transaction data provided")
+                raise DeBridgeConnectionError("Missing transaction data")
 
-            # Get transaction data from the stored result
-            tx_buffer = bytes.fromhex(tx_data["tx"]["data"][2:])  # Remove '0x' prefix
+            # Unified response format
+            response = {"orderId": tx_data.get("orderId")}
             
-            # Create and sign transaction
-            transaction = self.solana_connection.create_versioned_transaction(tx_buffer)
-            
-            # Send transaction
-            signature = self.solana_connection.send_transaction(
-                transaction,
-                opts={
-                    "skipPreflight": False,
-                    "preflightCommitment": "confirmed",
-                    "maxRetries": 3
-                }
-            )
-
+            if self._chain_type == "evm" or self._chain_type == "sonic":
+                signed_tx = self._chain_connection.sign_transaction(tx_data)
+                response["txHash"] = self._chain_connection.send_transaction(signed_tx)
+            elif self._chain_type == "solana":
+                tx_buffer = bytes.fromhex(tx_data["tx"]["data"][2:])
+                transaction = self._chain_connection.create_versioned_transaction(tx_buffer)
+                response["signature"] = await self._chain_connection.send_transaction(
+                    transaction, 
+                    opts={
+                        "skipPreflight": False,
+                        "preflightCommitment": "confirmed",
+                        "maxRetries": 3
+                    }
+                )
+            else:
+                raise DeBridgeConnectionError(f"Unsupported chain type: {self._chain_type}")
+                
             return {
-                "signature": signature,
+                "signature": response["signature"],
                 "orderId": tx_data.get("orderId")
             }
 
         except Exception as e:
-            logger.error(f"Failed to execute bridge transaction: {str(e)}")
-            raise DeBridgeAPIError(f"Failed to execute bridge transaction: {str(e)}")
+            logger.error(f"Bridge execution failed: {str(e)}")
+            raise DeBridgeConnectionError("Bridge transaction failed") from e
